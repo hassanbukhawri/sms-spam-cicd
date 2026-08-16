@@ -2,7 +2,7 @@
 
 A small ML model with a fully automated Jenkins pipeline: on every push, it
 trains a fresh model, gates the build on a minimum quality bar, and only
-deploys if the gate passes. The model itself is intentionally simple —
+deploys if the gate passes. The model itself is intentionally simple:
 the point of this project is the pipeline engineering around it, not the
 model.
 
