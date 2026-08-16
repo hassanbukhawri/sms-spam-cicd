@@ -12,7 +12,7 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "REPLACE_WITH_DOCKERHUB_USERNAME/sms-spam-classifier"
+        IMAGE_NAME = "hassanbukhawri/sms-spam-classifier"
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-credentials')
     }
 
