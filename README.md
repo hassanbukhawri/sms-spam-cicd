@@ -2,7 +2,7 @@
 
 A small ML model with a fully automated Jenkins pipeline: on every push, it
 trains a fresh model, gates the build on a minimum quality bar, and only
-deploys if the gate passes. The model itself is intentionally simple:
+deploys if the gate passes. The model itself is intentionally simple —
 the point of this project is the pipeline engineering around it, not the
 model.
 
@@ -23,6 +23,10 @@ Jenkins pipeline
     ├─ Push to Docker Hub
     └─ Deploy (restart container)
 ```
+
+Self-hosted end to end on an Oracle Cloud Always Free VM — Jenkins runs
+in a Docker container on the VM, and the deployed inference API runs in
+its own container alongside it.
 
 ## Why these choices
 
@@ -52,13 +56,118 @@ that depends on an external download succeeding is a flaky test suite.
 **Data fetched at pipeline-run time, not committed.** Keeps the repo small
 and makes the data source explicit and reproducible.
 
-## Jenkins Docker access
+## Infrastructure setup
 
-Jenkins runs in its own container, so building/pushing images and
-controlling the app container requires giving the Jenkins container access
-to the host's Docker daemon (mounting `/var/run/docker.sock` + installing
-the `docker` CLI inside the Jenkins container). See setup notes in the repo
-issues/wiki for the exact commands used on this deployment.
+This section documents how the hosting environment was actually built, so
+it's reproducible from scratch rather than assuming Jenkins/Docker already
+exist somewhere.
+
+### 1. Oracle Cloud VM (Always Free tier)
+
+- Shape: `VM.Standard.E2.1.Micro` (1 OCPU, 1GB RAM — the always-available
+  free shape; `VM.Standard.A1.Flex` is also free and more powerful but
+  subject to regional capacity limits)
+- Image: Canonical Ubuntu 24.04
+- Networking: a VCN created via Oracle's **"Create VCN with Internet
+  Connectivity"** wizard (this auto-provisions a public subnet, internet
+  gateway, and route table together — trying to configure these manually
+  during instance creation is more error-prone)
+- The instance's VNIC must be on the **public** subnet with "Automatically
+  assign public IPv4 address" enabled, or it won't be reachable at all
+- Security List: inbound TCP rules opened for port `8080` (Jenkins) and
+  `8000` (the deployed inference API), source `0.0.0.0/0`
+
+### 2. Swap space
+
+With only 1GB RAM, Jenkins' JVM needs headroom:
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+### 3. Docker
+
+```bash
+sudo apt update && sudo apt install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker ubuntu   # log out and back in to apply
+```
+
+### 4. Jenkins, with Docker access ("Docker-outside-of-Docker")
+
+Jenkins runs as a container, but pipeline stages need to run `docker build`
+and `docker push` — which means the Jenkins container needs access to the
+**host's** Docker daemon, not a nested Docker-in-Docker setup.
+
+```bash
+# Find the host's docker group GID
+getent group docker
+# → e.g. docker:x:112:ubuntu — the number you need is 112
+
+docker run -d \
+  -p 8080:8080 -p 50000:50000 \
+  -v jenkins_home:/var/jenkins_home \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --group-add 112 \
+  --name jenkins \
+  --restart unless-stopped \
+  jenkins/jenkins:lts
+
+# The base image doesn't ship the docker CLI, only socket access —
+# install it inside the container:
+docker exec -u root jenkins apt-get update
+docker exec -u root jenkins apt-get install -y docker.io python3-venv python3-pip
+
+# Verify Jenkins can reach the host daemon:
+docker exec jenkins docker ps
+```
+
+**Known limitation:** the installed `docker.io` / `python3-venv` packages
+live in the container's writable layer, not the `jenkins_home` volume. If
+this container is ever removed (not just stopped/restarted) and recreated,
+these packages need reinstalling. A cleaner long-term fix is a custom
+`FROM jenkins/jenkins:lts` image with these baked in — not done here since
+the current container is long-running and this only bites on a full
+teardown/rebuild.
+
+**Common pitfall:** `--group-add` takes only the numeric GID (e.g. `112`),
+not the full `getent` output string — passing the full string causes
+Jenkins to fail to start with "Unable to find group ... no matching
+entries in group file."
+
+### 5. Jenkins pipeline job
+
+- New Item → Pipeline
+- Build Triggers → check **"GitHub hook trigger for GITScm polling"**
+- Pipeline → Definition: **"Pipeline script from SCM"** → SCM: Git →
+  Repository URL: this repo's HTTPS URL → Script Path: `Jenkinsfile`
+  (default)
+
+### 6. Docker Hub credentials in Jenkins
+
+Manage Jenkins → Credentials → System → Global credentials → Add
+Credentials:
+- Kind: Username with password
+- Username: Docker Hub username
+- Password: a Docker Hub **access token** (Account Settings → Security →
+  New Access Token), not the account password
+- ID: `dockerhub-credentials` — must match exactly what the Jenkinsfile
+  references
+
+### 7. GitHub webhook
+
+Repo → Settings → Webhooks → Add webhook:
+- Payload URL: `http://<vm-public-ip>:8080/github-webhook/` (trailing
+  slash required)
+- Content type: `application/json`
+- Events: Just the push event
+
+Check "Recent Deliveries" for a green checkmark to confirm Jenkins is
+reachable from GitHub before relying on it.
 
 ## Running locally
 
